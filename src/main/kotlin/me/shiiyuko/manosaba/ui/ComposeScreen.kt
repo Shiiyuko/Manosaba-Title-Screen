@@ -30,21 +30,29 @@ import org.lwjgl.glfw.GLFW
 import org.lwjgl.opengl.GL33C
 import java.awt.event.KeyEvent
 import java.awt.event.MouseEvent
+import kotlin.math.max
 
 @OptIn(InternalComposeUiApi::class)
 abstract class ComposeScreen(title: Text) : Screen(title) {
+
+    companion object {
+        const val DESIGN_WIDTH = 1920f
+        const val DESIGN_HEIGHT = 1080f
+    }
 
     private val mc = MinecraftClient.getInstance()
     private var skiaContext: DirectContext? = null
     private var surface: Surface? = null
     private var renderTarget: BackendRenderTarget? = null
     private var composeScene: ComposeScene? = null
-    private var lastScaleFactor = mc.window.scaleFactor
 
     private val window get() = mc.window
-    private val scaleFactor get() = window.scaleFactor
     private val currentTime get() = System.currentTimeMillis()
     private val awtMods get() = AWTUtils.getAwtMods(window.handle)
+
+    private var renderScale = 1f
+    private var renderOffsetX = 0f
+    private var renderOffsetY = 0f
 
     @Composable
     abstract fun Content()
@@ -56,17 +64,17 @@ abstract class ComposeScreen(title: Text) : Screen(title) {
         surface = null
     }
 
-    private fun initCompose(width: Int, height: Int) {
+    private fun initCompose() {
         composeScene = (composeScene ?: CanvasLayersComposeScene(
-            density = Density(scaleFactor.toFloat()),
+            density = Density(1f),
             invalidate = {}
         ).apply { setContent { Content() } }).also {
-            it.density = Density(scaleFactor.toFloat())
-            it.size = IntSize(width, height)
+            it.density = Density(1f)
+            it.size = IntSize(DESIGN_WIDTH.toInt(), DESIGN_HEIGHT.toInt())
         }
     }
 
-    private fun buildCompose() {
+    private fun buildSkiaSurface() {
         val (frameWidth, frameHeight) = window.framebufferWidth to window.framebufferHeight
 
         surface?.takeIf { it.width == frameWidth && it.height == frameHeight }?.let { return }
@@ -84,18 +92,25 @@ abstract class ComposeScreen(title: Text) : Screen(title) {
         )
     }
 
-    override fun render(context: DrawContext, mouseX: Int, mouseY: Int, delta: Float) {
-        val needsReinit = composeScene == null ||
-                lastScaleFactor != scaleFactor ||
-                composeScene?.size?.let { it.width != window.width || it.height != window.height } == true
+    private fun calculateScaleParams() {
+        val fbWidth = window.framebufferWidth.toFloat()
+        val fbHeight = window.framebufferHeight.toFloat()
 
-        if (needsReinit) {
-            closeSkiaResources()
-            initCompose(window.width, window.height)
-            lastScaleFactor = scaleFactor
+        val scaleX = fbWidth / DESIGN_WIDTH
+        val scaleY = fbHeight / DESIGN_HEIGHT
+
+        renderScale = max(scaleX, scaleY)
+        renderOffsetX = (fbWidth - DESIGN_WIDTH * renderScale) / 2f
+        renderOffsetY = (fbHeight - DESIGN_HEIGHT * renderScale) / 2f
+    }
+
+    override fun render(context: DrawContext, mouseX: Int, mouseY: Int, delta: Float) {
+        if (composeScene == null) {
+            initCompose()
         }
 
-        buildCompose()
+        buildSkiaSurface()
+        calculateScaleParams()
 
         GlStateUtils.save()
         resetPixelStore()
@@ -103,7 +118,12 @@ abstract class ComposeScreen(title: Text) : Screen(title) {
 
         RenderSystem.enableBlend()
         surface?.let { s ->
-            composeScene?.render(s.canvas.asComposeCanvas(), System.nanoTime())
+            val canvas = s.canvas
+            canvas.save()
+            canvas.translate(renderOffsetX, renderOffsetY)
+            canvas.scale(renderScale, renderScale)
+            composeScene?.render(canvas.asComposeCanvas(), System.nanoTime())
+            canvas.restore()
             s.flush()
         }
         GlStateUtils.restore()
@@ -120,10 +140,16 @@ abstract class ComposeScreen(title: Text) : Screen(title) {
         GL33C.glPixelStorei(GL33C.GL_UNPACK_ALIGNMENT, 4)
     }
 
-    private fun Double.toScaled() = (this * scaleFactor).toFloat()
-    private fun Double.toScaledInt() = (this * scaleFactor).toInt()
+    private fun toDesignCoord(windowX: Double, windowY: Double): Offset {
+        val scaleFactor = window.scaleFactor
+        val fbX = windowX * scaleFactor
+        val fbY = windowY * scaleFactor
 
-    private fun toComposeOffset(x: Double, y: Double) = Offset(x.toScaled(), y.toScaled())
+        val designX = ((fbX - renderOffsetX) / renderScale).toFloat()
+        val designY = ((fbY - renderOffsetY) / renderScale).toFloat()
+
+        return Offset(designX, designY)
+    }
 
     private fun sendMouseEvent(
         mouseX: Double,
@@ -133,12 +159,13 @@ abstract class ComposeScreen(title: Text) : Screen(title) {
         pointerEventType: PointerEventType,
         scrollDelta: Offset? = null
     ) {
+        val designCoord = toDesignCoord(mouseX, mouseY)
         val event = AWTUtils.createMouseEvent(
-            mouseX.toScaledInt(), mouseY.toScaledInt(), awtMods, button, eventType
+            designCoord.x.toInt(), designCoord.y.toInt(), awtMods, button, eventType
         )
         composeScene?.sendPointerEvent(
             eventType = pointerEventType,
-            position = toComposeOffset(mouseX, mouseY),
+            position = designCoord,
             type = PointerType.Mouse,
             scrollDelta = scrollDelta ?: Offset.Zero,
             nativeEvent = event
@@ -152,8 +179,10 @@ abstract class ComposeScreen(title: Text) : Screen(title) {
     }
 
     override fun resize(client: MinecraftClient?, width: Int, height: Int) {
-        closeSkiaResources()
-        client?.let { initCompose(it.window.width, it.window.height) }
+        surface?.close()
+        renderTarget?.close()
+        surface = null
+        renderTarget = null
         super.resize(client, width, height)
     }
 
@@ -183,13 +212,14 @@ abstract class ComposeScreen(title: Text) : Screen(title) {
         horizontalAmount: Double,
         verticalAmount: Double
     ): Boolean {
+        val designCoord = toDesignCoord(mouseX, mouseY)
         val event = AWTUtils.createMouseWheelEvent(
-            mouseX.toScaledInt(), mouseY.toScaledInt(), mouseY, awtMods, MouseEvent.MOUSE_WHEEL
+            designCoord.x.toInt(), designCoord.y.toInt(), mouseY, awtMods, MouseEvent.MOUSE_WHEEL
         )
         composeScene?.sendPointerEvent(
-            position = toComposeOffset(mouseX, mouseY),
+            position = designCoord,
             eventType = PointerEventType.Scroll,
-            scrollDelta = toComposeOffset(horizontalAmount, -verticalAmount),
+            scrollDelta = Offset(horizontalAmount.toFloat(), -verticalAmount.toFloat()),
             nativeEvent = event
         )
         return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount)

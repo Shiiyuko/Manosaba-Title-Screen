@@ -23,9 +23,13 @@ import me.shiiyuko.manosaba.utils.UnitySpriteParser
 import net.minecraft.client.MinecraftClient
 import org.jetbrains.skia.*
 import org.lwjgl.opengl.GL33C
+import kotlin.math.max
 
 @OptIn(InternalComposeUiApi::class)
 object SplashOverlayRenderer {
+
+    private const val DESIGN_WIDTH = 1920f
+    private const val DESIGN_HEIGHT = 1080f
 
     private val mc = MinecraftClient.getInstance()
     private var skiaContext: DirectContext? = null
@@ -41,7 +45,6 @@ object SplashOverlayRenderer {
     private var logoAlpha = mutableStateOf(1f)
 
     private val window get() = mc.window
-    private val scaleFactor get() = window.scaleFactor
 
     private fun loadResources() {
         if (resourcesLoaded) return
@@ -54,16 +57,14 @@ object SplashOverlayRenderer {
             val jsonString = jsonStream.use { it.bufferedReader().readText() }
 
             val atlasData = UnitySpriteParser.parseAtlas(jsonString)
-            val atlasImage = org.jetbrains.skia.Image.makeFromEncoded(atlasBytes)
+            val atlasImage = Image.makeFromEncoded(atlasBytes)
 
             atlasData.sprites["BrandLogo_Acacia"]?.let { spriteData ->
-                val cropped = UnitySpriteParser.cropSprite(atlasImage, spriteData)
-                brandLogo = cropped.toComposeImageBitmap()
+                brandLogo = UnitySpriteParser.cropSprite(atlasImage, spriteData).toComposeImageBitmap()
             }
 
             atlasData.sprites["CompanyLogo_ReAER"]?.let { spriteData ->
-                val cropped = UnitySpriteParser.cropSprite(atlasImage, spriteData)
-                companyLogo = cropped.toComposeImageBitmap()
+                companyLogo = UnitySpriteParser.cropSprite(atlasImage, spriteData).toComposeImageBitmap()
             }
 
             resourcesLoaded = true
@@ -77,17 +78,17 @@ object SplashOverlayRenderer {
         surface = null
     }
 
-    private fun initCompose(width: Int, height: Int) {
+    private fun initCompose() {
         composeScene = (composeScene ?: CanvasLayersComposeScene(
-            density = Density(scaleFactor.toFloat()),
+            density = Density(1f),
             invalidate = {}
         ).apply { setContent { SplashContent() } }).also {
-            it.density = Density(scaleFactor.toFloat())
-            it.size = IntSize(width, height)
+            it.density = Density(1f)
+            it.size = IntSize(DESIGN_WIDTH.toInt(), DESIGN_HEIGHT.toInt())
         }
     }
 
-    private fun buildCompose() {
+    private fun buildSkiaSurface() {
         val (frameWidth, frameHeight) = window.framebufferWidth to window.framebufferHeight
 
         surface?.takeIf { it.width == frameWidth && it.height == frameHeight }?.let { return }
@@ -155,15 +156,19 @@ object SplashOverlayRenderer {
         progress.value = loadProgress
         logoAlpha.value = alpha
 
-        val needsReinit = composeScene == null ||
-                composeScene?.size?.let { it.width != window.width || it.height != window.height } == true
-
-        if (needsReinit) {
-            closeSkiaResources()
-            initCompose(window.width, window.height)
+        if (composeScene == null) {
+            initCompose()
         }
 
-        buildCompose()
+        buildSkiaSurface()
+
+        val fbWidth = window.framebufferWidth.toFloat()
+        val fbHeight = window.framebufferHeight.toFloat()
+        val scaleX = fbWidth / DESIGN_WIDTH
+        val scaleY = fbHeight / DESIGN_HEIGHT
+        val renderScale = max(scaleX, scaleY)
+        val offsetX = (fbWidth - DESIGN_WIDTH * renderScale) / 2f
+        val offsetY = (fbHeight - DESIGN_HEIGHT * renderScale) / 2f
 
         GlStateUtils.save()
         resetPixelStore()
@@ -171,7 +176,12 @@ object SplashOverlayRenderer {
 
         RenderSystem.enableBlend()
         surface?.let { s ->
-            composeScene?.render(s.canvas.asComposeCanvas(), System.nanoTime())
+            val canvas = s.canvas
+            canvas.save()
+            canvas.translate(offsetX, offsetY)
+            canvas.scale(renderScale, renderScale)
+            composeScene?.render(canvas.asComposeCanvas(), System.nanoTime())
+            canvas.restore()
             s.flush()
         }
         GlStateUtils.restore()
